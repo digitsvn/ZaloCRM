@@ -17,6 +17,10 @@ const prismaMock = {
   friend: { findMany: vi.fn(), count: vi.fn(), groupBy: vi.fn() },
 };
 
+// B3 fix — route giờ resolve accessible nicks qua helper getAccessibleZaloAccountIds
+// (owner/admin → cả org; non-admin → ACL + owned). Drive trực tiếp qua mock này.
+const getAccessibleZaloAccountIdsMock = vi.fn();
+
 vi.mock('../src/shared/database/prisma-client.js', () => ({ prisma: prismaMock }));
 vi.mock('../src/shared/utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -27,6 +31,7 @@ vi.mock('../src/modules/auth/auth-middleware.js', () => ({
 vi.mock('../src/modules/zalo/zalo-route-helpers.js', () => ({
   resolveAccount: vi.fn().mockResolvedValue({ id: 'za-1', orgId: 'org-1' }),
   checkAccess: vi.fn().mockResolvedValue(true),
+  getAccessibleZaloAccountIds: getAccessibleZaloAccountIdsMock,
   handleError: vi.fn().mockImplementation((reply: any, err: any) => {
     reply.status(500).send({ error: err?.message || 'Error' });
   }),
@@ -57,12 +62,12 @@ beforeEach(() => {
   prismaMock.friend.findMany.mockReset();
   prismaMock.friend.count.mockReset();
   prismaMock.friend.groupBy.mockReset();
+  getAccessibleZaloAccountIdsMock.mockReset();
 });
 
 describe('GET /api/v1/friends-db/all-nicks', () => {
   it('returns empty when user has 0 accessible nicks', async () => {
-    prismaMock.zaloAccountAccess.findMany.mockResolvedValue([]);
-    prismaMock.zaloAccount.findMany.mockResolvedValue([]);
+    getAccessibleZaloAccountIdsMock.mockResolvedValue([]);
     const res = await buildApp().inject({ method: 'GET', url: '/api/v1/friends-db/all-nicks' });
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
@@ -72,14 +77,8 @@ describe('GET /api/v1/friends-db/all-nicks', () => {
   });
 
   it('queries Friend filtered by accessible accountIds (union of access + owned)', async () => {
-    prismaMock.zaloAccountAccess.findMany.mockResolvedValue([
-      { zaloAccountId: 'za-A' },
-      { zaloAccountId: 'za-B' },
-    ]);
-    prismaMock.zaloAccount.findMany.mockResolvedValue([
-      { id: 'za-B' }, // overlap with access
-      { id: 'za-C' }, // owned but no access row
-    ]);
+    // Helper trả union đã dedup (za-A từ ACL, za-B overlap, za-C owned).
+    getAccessibleZaloAccountIdsMock.mockResolvedValue(['za-A', 'za-B', 'za-C']);
     prismaMock.friend.findMany.mockResolvedValue([
       { id: 'f1', zaloAccountId: 'za-A', contact: { fullName: 'KH 1' } },
     ]);
@@ -100,8 +99,7 @@ describe('GET /api/v1/friends-db/all-nicks', () => {
   });
 
   it('applies kind filter when provided', async () => {
-    prismaMock.zaloAccountAccess.findMany.mockResolvedValue([{ zaloAccountId: 'za-A' }]);
-    prismaMock.zaloAccount.findMany.mockResolvedValue([]);
+    getAccessibleZaloAccountIdsMock.mockResolvedValue(['za-A']);
     prismaMock.friend.findMany.mockResolvedValue([]);
     prismaMock.friend.count.mockResolvedValue(0);
     prismaMock.friend.groupBy.mockResolvedValue([]);
@@ -115,8 +113,7 @@ describe('GET /api/v1/friends-db/all-nicks', () => {
   });
 
   it('uses deterministic orderBy chain (lastInboundAt → lastOutboundAt → createdAt → id)', async () => {
-    prismaMock.zaloAccountAccess.findMany.mockResolvedValue([{ zaloAccountId: 'za-A' }]);
-    prismaMock.zaloAccount.findMany.mockResolvedValue([]);
+    getAccessibleZaloAccountIdsMock.mockResolvedValue(['za-A']);
     prismaMock.friend.findMany.mockResolvedValue([]);
     prismaMock.friend.count.mockResolvedValue(0);
     prismaMock.friend.groupBy.mockResolvedValue([]);
@@ -132,8 +129,7 @@ describe('GET /api/v1/friends-db/all-nicks', () => {
   });
 
   it('respects pagination params (page=2, limit=10)', async () => {
-    prismaMock.zaloAccountAccess.findMany.mockResolvedValue([{ zaloAccountId: 'za-A' }]);
-    prismaMock.zaloAccount.findMany.mockResolvedValue([]);
+    getAccessibleZaloAccountIdsMock.mockResolvedValue(['za-A']);
     prismaMock.friend.findMany.mockResolvedValue([]);
     prismaMock.friend.count.mockResolvedValue(0);
     prismaMock.friend.groupBy.mockResolvedValue([]);

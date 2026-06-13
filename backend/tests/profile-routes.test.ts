@@ -75,14 +75,18 @@ describe('GET /profile/last-online/:userId', () => {
     zaloOpsMock.getLastOnline.mockResolvedValue({ lastOnline: ts });
     const res = await buildApp().inject({ method: 'GET', url: `${BASE}/last-online/u1` });
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toMatchObject({ lastOnline: { lastOnline: ts } });
+    // Route trả format flat qua presence-service: { lastOnline: number|null, showStatus, isOnline, fetchedAt }
+    expect(JSON.parse(res.body)).toMatchObject({ lastOnline: ts });
     expect(zaloOpsMock.getLastOnline).toHaveBeenCalledWith('za-1', 'u1');
   });
 
-  it('returns 500 when zaloOps throws', async () => {
+  it('returns 200 with null fallback when presence lookup fails', async () => {
+    // presence-service nuốt lỗi SDK (graceful degradation): trả null → route fallback 200.
+    // Dùng userId khác (u2) để tránh cache 30s từ happy-path test ở trên.
     zaloOpsMock.getLastOnline.mockRejectedValue(new Error('lookup failed'));
-    const res = await buildApp().inject({ method: 'GET', url: `${BASE}/last-online/u1` });
-    expect(res.statusCode).toBe(500);
+    const res = await buildApp().inject({ method: 'GET', url: `${BASE}/last-online/u2` });
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ lastOnline: null, showStatus: false, isOnline: false });
   });
 });
 
