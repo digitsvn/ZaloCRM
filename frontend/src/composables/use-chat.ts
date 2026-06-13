@@ -564,6 +564,9 @@ export function useChat() {
       const payload: Record<string, unknown> = { content };
       if (replyMessageId) payload.replyMessageId = replyMessageId;
       if (styles && styles.length > 0) payload.styles = styles;
+      // 2026-06-13 Idempotency: clientMsgId duy nhất/lần gửi → BE bỏ qua nếu request
+      // bị retry (double-click / mạng chập chờn), tránh gửi tin trùng.
+      payload.clientMsgId = (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`);
       const res = await api.post(`/conversations/${conversationId}/messages`, payload);
       if (conversationId === selectedConvId.value) {
         if (!messages.value.find(m => m.id === res.data.id)) {

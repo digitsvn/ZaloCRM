@@ -37,6 +37,12 @@ vi.mock('../src/modules/zalo/zalo-route-helpers.js', () => ({
     reply.status(500).send({ error: err?.message || 'Error' });
   }),
 }));
+// POST /requests gọi markFriendRequestSent (side-effect ghi DB) sau khi gửi.
+// Mock để test route không chạm prisma thật.
+vi.mock('../src/modules/zalo/friend-event-handler.js', () => ({
+  markFriendRequestSent: vi.fn(),
+  applyFriendTransition: vi.fn(),
+}));
 
 const { friendRoutes } = await import('../src/modules/zalo/friend-routes.js');
 
@@ -96,7 +102,8 @@ describe('Friend Queries', () => {
     const res = await buildApp().inject({ method: 'GET', url: `${BASE}/aliases` });
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toMatchObject({ data: [{ alias: 'Bob' }] });
-    expect(zaloOpsMock.getAliasList).toHaveBeenCalledWith('za-1');
+    // Route truyền pagination mặc định: getAliasList(accountId, count=100, page=1)
+    expect(zaloOpsMock.getAliasList).toHaveBeenCalledWith('za-1', 100, 1);
   });
 });
 

@@ -557,6 +557,10 @@ model Message {
   // Zalo client message id (2026-05-21) — KHÁC zaloMsgId (server snowflake). Cần cho api.undo
   // (Zalo expect cả msgId + cliMsgId). Tin cũ trước migration chưa có column này → null.
   zaloCliMsgId    String?   @map("zalo_cli_msg_id")
+  // Idempotency key do FE sinh (uuid) mỗi lần bấm Gửi (2026-06-13). Chống gửi
+  // trùng khi double-click / retry mạng — BE short-circuit nếu key đã tồn tại.
+  // Null cho tin inbound + tin cũ trước migration.
+  clientMsgId     String?   @map("client_msg_id")
   sentAt          DateTime  @map("sent_at")
   // Read receipts (2026-05-21 Wave 1+2 — wire `delivered_messages` + `seen_messages`
   // SDK events). Cả 2 chỉ set cho tin OUTGOING (senderType='self'); KH-side luôn null.
@@ -577,6 +581,8 @@ model Message {
   reactions    MessageReaction[]
 
   @@unique([conversationId, zaloMsgId])
+  // Idempotency gửi tin: 1 clientMsgId chỉ tạo đúng 1 Message/conversation.
+  @@unique([conversationId, clientMsgId])
   @@index([conversationId, albumKey])
   // Composite index cho sort theo Zalo Snowflake — primary order khi list messages.
   @@index([conversationId, zaloMsgIdNum(sort: Desc)])

@@ -65,6 +65,11 @@ export function stopTaskWorker(): void {
   }
 }
 
+/** True khi 1 tick đang xử lý task (dùng cho graceful shutdown drain). */
+export function isTaskWorkerBusy(): boolean {
+  return isRunning;
+}
+
 // Single tick — exposed for testing / manual run
 export async function tick(): Promise<void> {
   if (isRunning) return; // overlap protection

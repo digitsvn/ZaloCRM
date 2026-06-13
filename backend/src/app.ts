@@ -83,6 +83,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 async function bootstrap() {
   const app = Fastify({ logger: false });
+  // Cờ shutdown — khai báo sớm vì /health đọc nó (tránh TDZ nếu request đến
+  // trong lúc startup). Set true bởi gracefulShutdown() ở cuối bootstrap.
+  let shuttingDown = false;
 
   // ── Plugins ──────────────────────────────────────────────────────────────
 
@@ -214,13 +217,18 @@ async function bootstrap() {
   await app.register(profileRoutes);
   await app.register(credentialRoutes);
 
-  // Liveness/readiness probe — also checks DB connectivity
-  app.get('/health', async () => {
+  // Liveness/readiness probe — also checks DB connectivity.
+  // Trả HTTP 503 khi DB down để Docker/k8s healthcheck (wget/curl/node) phát hiện
+  // được container unhealthy và restart. 200 chỉ khi thực sự khỏe.
+  app.get('/health', async (_request, reply) => {
+    if (shuttingDown) {
+      return reply.code(503).send({ status: 'shutting_down', timestamp: new Date().toISOString() });
+    }
     try {
       await prisma.$queryRaw`SELECT 1`;
       return { status: 'ok', db: 'connected', timestamp: new Date().toISOString() };
     } catch {
-      return { status: 'error', db: 'disconnected', timestamp: new Date().toISOString() };
+      return reply.code(503).send({ status: 'error', db: 'disconnected', timestamp: new Date().toISOString() });
     }
   });
 
@@ -327,6 +335,79 @@ async function bootstrap() {
   } catch (err) {
     logger.error('Failed to load accounts for reconnect:', err);
   }
+
+  // ── Graceful shutdown ───────────────────────────────────────────────────
+  // Docker/PM2/k8s gửi SIGTERM khi stop/restart/deploy. Nếu không xử lý, process
+  // bị kill cứng → HTTP request đang chạy bị cắt, task automation kẹt state
+  // 'running' (chờ 5p lease mới recover), BullMQ job có thể mất. Handler này:
+  //   1. dừng các poll loop (worker/scheduler) → không nhận việc mới
+  //   2. app.close() → drain HTTP request đang chạy
+  //   3. chờ task-worker tick hiện tại xong (tránh task kẹt 'running')
+  //   4. đóng BullMQ worker (FB lead/form) cho job in-flight hoàn tất/requeue sạch
+  //   5. đóng Socket.IO + ngắt Prisma rồi exit(0)
+  // Hard-timeout ép exit(1) nếu cleanup treo. Đặt SHUTDOWN_TIMEOUT_MS khớp với
+  // stop_grace_period trong docker-compose.
+  const gracefulShutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    const timeoutMs = Number(process.env.SHUTDOWN_TIMEOUT_MS) || 20_000;
+    logger.info(`[shutdown] ${signal} received — graceful shutdown (timeout ${timeoutMs}ms)`);
+    const forceTimer = setTimeout(() => {
+      logger.error('[shutdown] timed out — forcing exit');
+      process.exit(1);
+    }, timeoutMs);
+    forceTimer.unref();
+
+    // 1. Dừng poll loops / scheduler (best-effort, không để 1 lỗi chặn phần còn lại)
+    const stopSteps: Array<[string, () => unknown | Promise<unknown>]> = [
+      ['automation-engine', async () => (await import('./modules/automation/engine/index.js')).stopAutomationEngine()],
+      ['broadcast-scheduler', async () => (await import('./modules/automation/broadcasts/broadcast-scheduler.js')).stopBroadcastScheduler()],
+      ['scoring-scheduler', async () => (await import('./modules/scoring/scoring-scheduler.js')).stopScoringScheduler()],
+      ['friend-sync-cron', async () => (await import('./modules/zalo/friend-sync-cron.js')).stopFriendSyncCron()],
+      ['presence-cron', async () => (await import('./modules/zalo/presence-service.js')).stopPresenceCron()],
+      ['status-log-cron', async () => (await import('./modules/zalo/status-log-checkpoint-cron.js')).stopStatusLogCheckpointCron()],
+      ['list-enrichment', async () => (await import('./modules/automation/lists/list-enrichment-service.js')).stopListEnrichmentWorker()],
+      ['fb-token-cron', async () => (await import('./modules/integrations/providers/facebook/facebook-token-refresh-cron.js')).stopFacebookTokenRefreshCron()],
+    ];
+    for (const [name, fn] of stopSteps) {
+      try { await fn(); } catch (err) { logger.warn(`[shutdown] stop ${name} failed:`, err); }
+    }
+
+    // 2. Drain HTTP — Fastify ngừng nhận kết nối mới, chờ request đang chạy xong
+    try { await app.close(); logger.info('[shutdown] HTTP server closed'); }
+    catch (err) { logger.warn('[shutdown] app.close failed:', err); }
+
+    // 3. Chờ task-worker tick hiện tại hoàn tất (tối đa 5s)
+    try {
+      const { isTaskWorkerBusy } = await import('./modules/automation/engine/index.js');
+      const drainDeadline = Date.now() + 5_000;
+      while (isTaskWorkerBusy() && Date.now() < drainDeadline) {
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      if (isTaskWorkerBusy()) logger.warn('[shutdown] task-worker still busy after drain window (lease will recover)');
+    } catch (err) { logger.warn('[shutdown] task-worker drain failed:', err); }
+
+    // 4. Đóng BullMQ worker (graceful — chờ job active xong)
+    const bullSteps: Array<[string, () => Promise<unknown>]> = [
+      ['fb-lead-worker', async () => (await import('./modules/integrations/providers/facebook/facebook-lead-worker.js')).stopFacebookLeadIngestionWorker()],
+      ['fb-form-worker', async () => (await import('./modules/integrations/providers/facebook/facebook-form-discovery-worker.js')).stopFormDiscoveryWorker()],
+    ];
+    for (const [name, fn] of bullSteps) {
+      try { await fn(); } catch (err) { logger.warn(`[shutdown] close ${name} failed:`, err); }
+    }
+
+    // 5. Đóng Socket.IO + ngắt Prisma
+    try { await new Promise<void>((resolve) => io.close(() => resolve())); }
+    catch (err) { logger.warn('[shutdown] io.close failed:', err); }
+    try { await prisma.$disconnect(); }
+    catch (err) { logger.warn('[shutdown] prisma.$disconnect failed:', err); }
+
+    clearTimeout(forceTimer);
+    logger.info('[shutdown] complete — exiting');
+    process.exit(0);
+  };
+  process.once('SIGTERM', () => void gracefulShutdown('SIGTERM'));
+  process.once('SIGINT', () => void gracefulShutdown('SIGINT'));
 }
 
 // Keep process alive — log but never crash on unhandled errors

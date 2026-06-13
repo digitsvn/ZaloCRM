@@ -88,9 +88,10 @@ describe('syncFriendsForAccount — SDK fetch errors', () => {
     zaloOpsMock.getSentFriendRequests.mockRejectedValue(new Error('rate_limited'));
     prismaMock.friend.findMany.mockResolvedValue([]);
     const r = await syncFriendsForAccount('za-err', 'org-1', { trigger: 'cron' });
-    // .catch(() => []) absorbs reject → liveCount 0 but no service-level error
+    // B4 fix: lỗi SDK bubble lên outer catch → errors++ + logActivity (không còn nuốt lỗi),
+    // để sale phân biệt "rate-limit/disconnect" với "0 friends" thật.
     expect(r.liveCount).toBe(0);
-    expect(r.errors).toBe(0);
+    expect(r.errors).toBe(1);
   });
 });
 
@@ -191,7 +192,8 @@ describe('syncFriendsForAccount — contact resolution', () => {
         avatarUrl: 'avatar.png',
         hasZalo: true,
       }),
-      select: { id: true },
+      // B8 backfill đọc contact.fullName ngay sau create → select thêm fullName
+      select: { id: true, fullName: true },
     });
   });
 });

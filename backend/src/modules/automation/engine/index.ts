@@ -10,7 +10,7 @@
 import { logger } from '../../../shared/utils/logger.js';
 import { automationEventBus } from './event-bus.js';
 import { materializeFromEvent } from './campaign-materializer.js';
-import { startTaskWorker } from './task-worker.js';
+import { startTaskWorker, stopTaskWorker } from './task-worker.js';
 import { registerActionHandler } from './action-dispatcher.js';
 import {
   requestFriendHandler,
@@ -56,6 +56,25 @@ export function startAutomationEngine(): void {
 
   logger.info('[automation.engine] started — event bus + 3 action handlers + worker + cron');
 }
+
+/**
+ * Graceful stop: dừng poll loop của worker + cron scheduler.
+ * In-flight tick (nếu có) tự hoàn tất; caller có thể chờ isTaskWorkerBusy()===false.
+ */
+export async function stopAutomationEngine(): Promise<void> {
+  if (!isStarted) return;
+  stopTaskWorker();
+  try {
+    const { stopCronEventScheduler } = await import('./cron-event-scheduler.js');
+    stopCronEventScheduler();
+  } catch (err) {
+    logger.error('[automation.engine] cron scheduler stop failed:', err);
+  }
+  isStarted = false;
+  logger.info('[automation.engine] stopped');
+}
+
+export { isTaskWorkerBusy } from './task-worker.js';
 
 export { automationEventBus } from './event-bus.js';
 export { materializeFromEvent } from './campaign-materializer.js';

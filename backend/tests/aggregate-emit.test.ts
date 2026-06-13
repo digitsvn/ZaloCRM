@@ -75,6 +75,8 @@ describe('applyFriendAggregate — emit friend:updated', () => {
           update: vi.fn(),
         },
         contact: {
+          // B8 backfill block (contact-aggregate.ts) gọi findUnique trước khi tạo Friend.
+          findUnique: vi.fn().mockResolvedValue({ fullName: 'KH An', avatarUrl: 'http://a.png' }),
           update: vi.fn(),
         },
       };
@@ -119,7 +121,7 @@ describe('applyFriendAggregate — emit friend:updated', () => {
           }),
           update: vi.fn().mockResolvedValue({}),
         },
-        contact: { update: vi.fn() },
+        contact: { findUnique: vi.fn().mockResolvedValue({ fullName: 'KH', avatarUrl: 'x' }), update: vi.fn() },
       };
       await cb(tx);
     });
@@ -155,7 +157,7 @@ describe('applyFriendAggregate — emit friend:updated', () => {
           }),
           update: vi.fn().mockResolvedValue({}),
         },
-        contact: { update: vi.fn() },
+        contact: { findUnique: vi.fn().mockResolvedValue({ fullName: 'KH', avatarUrl: 'x' }), update: vi.fn() },
       };
       await cb(tx);
     });

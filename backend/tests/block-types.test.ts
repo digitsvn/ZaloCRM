@@ -87,9 +87,11 @@ describe('validateBlockContent — send_message', () => {
   });
 
   it('rejects attachment with bad kind', () => {
+    // 'video' nay là kind hợp lệ (Phase 7 mở rộng image|video|file|link).
+    // Dùng kind ngoài allow-list để test validation thật sự.
     const r = validateBlockContent('send_message', {
       textVariants: ['ok'],
-      attachments: [{ kind: 'video', url: 'https://x' }],
+      attachments: [{ kind: 'sticker', url: 'https://x' }],
     });
     expect(r.ok).toBe(false);
   });

@@ -1738,6 +1738,9 @@ async function handleImageFiles(files: File[]) {
   try {
     const fd = new FormData();
     for (const f of files) fd.append('files', f, f.name);
+    // Idempotency 2026-06-13: clientMsgId/batch → BE bỏ qua nếu request bị retry
+    // (double-click / mạng chập chờn), tránh gửi trùng ảnh.
+    fd.append('clientMsgId', globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await api.post(`/conversations/${props.conversation.id}/attachments`, fd, {
       headers: { 'Content-Type': 'multipart/form-data' },
     });
@@ -1756,6 +1759,8 @@ async function handleFiles(files: File[]) {
   try {
     const fd = new FormData();
     for (const f of files) fd.append('files', f, f.name);
+    // Idempotency 2026-06-13: clientMsgId/batch → BE bỏ qua nếu request bị retry.
+    fd.append('clientMsgId', globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await api.post(`/conversations/${props.conversation.id}/attachments`, fd, {
       headers: { 'Content-Type': 'multipart/form-data' },
     });
