@@ -775,10 +775,11 @@ export async function chatRoutes(app: FastifyInstance) {
     // 2026-05-21: thêm `styles` cho Zalo RTF (bold/italic/underline/strikethrough).
     // Format: [{st: 'b'|'i'|'u'|'s', start: number, len: number}, ...]
     // FE extract từ Tiptap editor JSON, BE pass thẳng vào api.sendMessage.
-    const { content, replyMessageId, styles } = request.body as {
+    const { content, replyMessageId, styles, clientMsgId } = request.body as {
       content: string;
       replyMessageId?: string;
       styles?: Array<{ st: string; start: number; len: number }>;
+      clientMsgId?: string;
     };
 
     if (!content?.trim()) return reply.status(400).send({ error: 'Content required' });
@@ -801,6 +802,19 @@ export async function chatRoutes(app: FastifyInstance) {
           error: 'Nick này đang bật Riêng tư — chỉ chính chủ mới gửi tin nhắn được. Vui lòng nhờ chủ nick gửi.',
           code: 'PRIVACY_LOCKED',
         });
+      }
+    }
+
+    // IDEMPOTENCY 2026-06-13: FE sinh clientMsgId mỗi lần bấm Gửi. Nếu request bị
+    // retry (double-click / mạng chập chờn) với cùng clientMsgId → trả lại tin đã
+    // gửi thay vì gửi lần 2 (tránh KH nhận tin trùng + tốn quota Zalo).
+    if (clientMsgId) {
+      const existing = await prisma.message.findFirst({
+        where: { conversationId: id, clientMsgId },
+      });
+      if (existing) {
+        logger.info(`[chat] idempotent skip — clientMsgId ${clientMsgId} đã gửi (msg ${existing.id})`);
+        return { ...existing, zaloMsgIdNum: existing.zaloMsgIdNum?.toString() ?? null };
       }
     }
 
@@ -857,22 +871,34 @@ export async function chatRoutes(app: FastifyInstance) {
         : content;
       const persistedContentType = hasStyles ? 'rich' : 'text';
 
-      const message = await prisma.message.create({
-        data: {
-          id: randomUUID(),
-          conversationId: id,
-          zaloMsgId: zaloMsgId || null,
-          zaloMsgIdNum: zaloMsgId && /^\d+$/.test(zaloMsgId) ? BigInt(zaloMsgId) : null,
-          senderType: 'self',
-          senderUid: conversation.zaloAccount.zaloUid || '',
-          senderName: 'Staff',
-          content: persistedContent,
-          contentType: persistedContentType,
-          quote: quote ?? undefined,
-          sentAt: new Date(),
-          repliedByUserId: user.id,
-        },
-      });
+      let message;
+      try {
+        message = await prisma.message.create({
+          data: {
+            id: randomUUID(),
+            conversationId: id,
+            clientMsgId: clientMsgId || null,
+            zaloMsgId: zaloMsgId || null,
+            zaloMsgIdNum: zaloMsgId && /^\d+$/.test(zaloMsgId) ? BigInt(zaloMsgId) : null,
+            senderType: 'self',
+            senderUid: conversation.zaloAccount.zaloUid || '',
+            senderName: 'Staff',
+            content: persistedContent,
+            contentType: persistedContentType,
+            quote: quote ?? undefined,
+            sentAt: new Date(),
+            repliedByUserId: user.id,
+          },
+        });
+      } catch (e: any) {
+        // P2002: race 2 request cùng clientMsgId qua được pre-check → bản ghi đã
+        // tồn tại. Trả lại tin đã lưu thay vì lỗi (vẫn idempotent).
+        if (e?.code === 'P2002' && clientMsgId) {
+          const existing = await prisma.message.findFirst({ where: { conversationId: id, clientMsgId } });
+          if (existing) return { ...existing, zaloMsgIdNum: existing.zaloMsgIdNum?.toString() ?? null };
+        }
+        throw e;
+      }
 
       await prisma.conversation.update({
         where: { id },
@@ -939,17 +965,47 @@ export async function chatRoutes(app: FastifyInstance) {
     const { pipeline } = await import('node:stream/promises');
 
     const tmpFiles: string[] = [];
+    let clientMsgId = '';
     try {
-      const parts = (request as unknown as { parts(): AsyncIterable<{ type: string; file: NodeJS.ReadableStream; filename: string }> }).parts();
+      const parts = (request as unknown as { parts(): AsyncIterable<{ type: string; file?: NodeJS.ReadableStream; filename?: string; fieldname?: string; value?: unknown }> }).parts();
       for await (const part of parts) {
         if (part.type === 'file' && part.file) {
           const safeName = (part.filename || 'image').replace(/[^a-zA-Z0-9._-]/g, '_');
           const tmpPath = path.join(os.tmpdir(), `zalo-upload-${randomUUID()}-${safeName}`);
           await pipeline(part.file, fs.createWriteStream(tmpPath));
           tmpFiles.push(tmpPath);
+        } else if (part.type === 'field' && part.fieldname === 'clientMsgId') {
+          clientMsgId = String(part.value ?? '');
         }
       }
       if (!tmpFiles.length) return reply.status(400).send({ error: 'No files uploaded' });
+
+      // IDEMPOTENCY 2026-06-13: chống gửi trùng khi retry. Mỗi ảnh khoá theo
+      // `${clientMsgId}:${index}`. Pre-check trước khi upload/gửi lên Zalo.
+      const batchKey = clientMsgId || null;
+      if (batchKey) {
+        const existing = await prisma.message.findMany({
+          where: { conversationId: id, clientMsgId: { startsWith: `${batchKey}:` } },
+          orderBy: { clientMsgId: 'asc' },
+        });
+        if (existing.length > 0) {
+          logger.info(`[chat] upload-image idempotent skip — clientMsgId ${batchKey} đã gửi (${existing.length} msg)`);
+          return { success: true, count: existing.length, messages: existing };
+        }
+      }
+      const persistMsg = async (fileIndex: number, data: Record<string, unknown>) => {
+        const withKey = { ...data, clientMsgId: batchKey ? `${batchKey}:${fileIndex}` : null };
+        if (!batchKey) return prisma.message.create({ data: withKey as any });
+        try {
+          return await prisma.message.create({ data: withKey as any });
+        } catch (e: any) {
+          if (e?.code === 'P2002') {
+            const found = await prisma.message.findFirst({ where: { conversationId: id, clientMsgId: withKey.clientMsgId } });
+            if (found) return found;
+          }
+          throw e;
+        }
+      };
 
       const threadType = conversation.threadType === 'group' ? 1 : 0;
       zaloRateLimiter.recordSend(conversation.zaloAccountId);
@@ -1002,20 +1058,18 @@ export async function chatRoutes(app: FastifyInstance) {
           contentType = 'file';
         }
 
-        const msg = await prisma.message.create({
-          data: {
-            id: randomUUID(),
-            conversationId: id,
-            zaloMsgId: zaloMsgId || null,
-            zaloMsgIdNum: zaloMsgId && /^\d+$/.test(zaloMsgId) ? BigInt(zaloMsgId) : null,
-            senderType: 'self',
-            senderUid: conversation.zaloAccount.zaloUid || '',
-            senderName: 'Staff',
-            content,
-            contentType,
-            sentAt: new Date(),
-            repliedByUserId: user.id,
-          },
+        const msg = await persistMsg(i, {
+          id: randomUUID(),
+          conversationId: id,
+          zaloMsgId: zaloMsgId || null,
+          zaloMsgIdNum: zaloMsgId && /^\d+$/.test(zaloMsgId) ? BigInt(zaloMsgId) : null,
+          senderType: 'self',
+          senderUid: conversation.zaloAccount.zaloUid || '',
+          senderName: 'Staff',
+          content,
+          contentType,
+          sentAt: new Date(),
+          repliedByUserId: user.id,
         });
         createdMessages.push(msg);
       }

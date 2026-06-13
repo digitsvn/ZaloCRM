@@ -94,4 +94,36 @@ describe('POST /api/v1/conversations/:id/messages', () => {
       data: expect.objectContaining({ quote: expect.objectContaining({ msgId: 'zalo-reply-1' }) }),
     }));
   });
+
+  it('idempotent — trả tin đã gửi, KHÔNG gửi lại khi clientMsgId đã tồn tại', async () => {
+    // Pre-check findFirst by clientMsgId trả về bản ghi cũ → short-circuit.
+    prismaMock.message.findFirst.mockResolvedValue({ id: 'existing-1', content: 'thanks', zaloMsgIdNum: null });
+    const app = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/conversations/conv-1/messages',
+      payload: { content: 'thanks', clientMsgId: 'cm-dup-123' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ id: 'existing-1' });
+    // KHÔNG gọi Zalo SDK + KHÔNG tạo Message mới
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(prismaMock.message.create).not.toHaveBeenCalled();
+  });
+
+  it('lần gửi đầu — lưu clientMsgId vào Message và gửi qua Zalo', async () => {
+    prismaMock.message.findFirst.mockResolvedValue(null); // chưa có tin trùng key
+    prismaMock.message.create.mockResolvedValue({ id: 'msg-new', content: 'hi', zaloMsgIdNum: null });
+    const app = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/conversations/conv-1/messages',
+      payload: { content: 'hi', clientMsgId: 'cm-new-456' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(sendMessageMock).toHaveBeenCalled();
+    expect(prismaMock.message.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ clientMsgId: 'cm-new-456' }),
+    }));
+  });
 });
