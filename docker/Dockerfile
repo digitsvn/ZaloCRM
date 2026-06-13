@@ -32,5 +32,9 @@ RUN mkdir -p /var/lib/zalo-crm/files
 
 EXPOSE 3000
 ENTRYPOINT ["/sbin/tini", "--"]
-# Push schema to DB then start server
-CMD ["sh", "-c", "npx prisma db push --accept-data-loss --url \"$DATABASE_URL\" && node dist/app.js"]
+# Apply pending migrations (an toàn, KHÔNG data-loss) rồi start server.
+# Thay cho `db push --accept-data-loss` trước đây — `migrate deploy` chỉ áp các
+# migration trong prisma/migrations theo thứ tự, fail-safe nếu có drift thay vì
+# âm thầm xoá dữ liệu. LƯU Ý: DB hiện hữu (từng dùng db push) phải được baseline
+# 1 lần trước khi đổi sang image này — xem docs/HUONG-DAN-MIGRATION-BASELINE.md.
+CMD ["sh", "-c", "npx prisma migrate deploy && node dist/app.js"]
